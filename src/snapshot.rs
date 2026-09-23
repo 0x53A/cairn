@@ -8,15 +8,14 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
-    fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+    fs::{self, File},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
 const PAGE_ENTRIES: usize = 128;
 pub use crate::chunking::{DEFAULT_CHUNK, MAX_CHUNK};
-const MAX_DEPTH: usize = 256;
+pub(crate) const MAX_DEPTH: usize = 256;
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Logical {
@@ -30,6 +29,52 @@ pub struct Logical {
 pub struct Node {
     pub logical: Logical,
     pub recipe: Option<String>,
+}
+
+pub(crate) fn validate_node(node: &Node) -> Result<()> {
+    let logical = &node.logical;
+    ensure!(logical.mode <= 0o777, "unsupported permission bits");
+    ensure!(valid_id(&logical.digest), "invalid logical digest");
+    ensure!(
+        node.recipe.as_deref().is_none_or(valid_id),
+        "invalid recipe ID"
+    );
+    match logical.kind.as_str() {
+        "directory" => ensure!(
+            logical.size == 0 && logical.target.is_none(),
+            "invalid directory metadata"
+        ),
+        "file" => {
+            ensure!(logical.target.is_none(), "file has a symlink target");
+            ensure!(
+                (logical.size == 0) == node.recipe.is_none(),
+                "file size and recipe disagree"
+            );
+            if logical.size == 0 {
+                ensure!(
+                    logical.digest == blake3::hash(b"").to_hex().as_str(),
+                    "invalid empty file digest"
+                );
+            }
+        }
+        "symlink" => {
+            let target = logical
+                .target
+                .as_deref()
+                .context("missing symlink target")?;
+            ensure!(
+                node.recipe.is_none()
+                    && logical.mode == 0o777
+                    && !target.is_empty()
+                    && !target.contains('\0')
+                    && target.len() as u64 == logical.size
+                    && blake3::hash(target.as_bytes()).to_hex().as_str() == logical.digest,
+                "symlink identity mismatch"
+            );
+        }
+        _ => bail!("unsupported entry kind"),
+    }
+    Ok(())
 }
 #[derive(Serialize, Deserialize)]
 pub struct Entry {
@@ -112,6 +157,7 @@ pub fn load_snapshot(store: &Store, keys: &Keys, id: &str) -> Result<Snapshot> {
         snap.root.logical.kind == "directory",
         "snapshot root is not a directory"
     );
+    validate_node(&snap.root)?;
     Ok(snap)
 }
 
@@ -135,7 +181,7 @@ pub fn verify(store: &Store, keys: &Keys, id: &str) -> Result<usize> {
             get_object(store, keys, &id).with_context(|| format!("verify object {id}"))?;
         match payload.first() {
             Some(b'M') => {
-                get_page(store, keys, &id)?;
+                decode_page(&payload, &refs)?;
             }
             Some(b'C') => ensure!(refs.is_empty(), "chunk has references"),
             _ => bail!("invalid object type: {id}"),
@@ -145,7 +191,7 @@ pub fn verify(store: &Store, keys: &Keys, id: &str) -> Result<usize> {
     Ok(seen.len())
 }
 
-fn get_object(store: &Store, keys: &Keys, id: &str) -> Result<(Vec<u8>, Vec<String>)> {
+pub(crate) fn get_object(store: &Store, keys: &Keys, id: &str) -> Result<(Vec<u8>, Vec<String>)> {
     let (payload, refs) = keys.open(&store.get(&format!("objects/{id}"))?)?;
     ensure!(
         keys.object_id(&payload) == id,
@@ -153,8 +199,11 @@ fn get_object(store: &Store, keys: &Keys, id: &str) -> Result<(Vec<u8>, Vec<Stri
     );
     Ok((payload, refs))
 }
-fn get_page(store: &Store, keys: &Keys, id: &str) -> Result<Page> {
+pub(crate) fn get_page(store: &Store, keys: &Keys, id: &str) -> Result<Page> {
     let (bytes, refs) = get_object(store, keys, id)?;
+    decode_page(&bytes, &refs)
+}
+fn decode_page(bytes: &[u8], refs: &[String]) -> Result<Page> {
     ensure!(bytes.first() == Some(&b'M'), "not a metadata object");
     let page: Page = serde_json::from_slice(&bytes[1..])?;
     ensure!(page.refs() == refs, "metadata references mismatch");
@@ -237,13 +286,7 @@ impl<'a> Builder<'a> {
         {
             return Err(error.into());
         }
-        let btrfs = std::process::Command::new("stat")
-            .args(["-f", "-c", "%T"])
-            .arg(&root)
-            .output()
-            .is_ok_and(|o| {
-                o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "btrfs"
-            });
+        let btrfs = rustix::fs::fstatfs(File::open(&root)?)?.f_type == 0x9123683e;
         Ok(Self {
             store,
             keys,
@@ -428,7 +471,7 @@ impl<'a> Builder<'a> {
     }
 }
 
-fn directory_entries(store: &Store, keys: &Keys, node: &Node) -> Result<Vec<Entry>> {
+pub(crate) fn directory_entries(store: &Store, keys: &Keys, node: &Node) -> Result<Vec<Entry>> {
     let mut next = node.recipe.clone();
     let mut seen = HashSet::new();
     let mut entries = Vec::new();
@@ -449,6 +492,7 @@ fn directory_entries(store: &Store, keys: &Keys, node: &Node) -> Result<Vec<Entr
     let mut h = directory_hasher(node.logical.mode);
     let mut last: Option<&str> = None;
     for e in &entries {
+        validate_node(&e.node)?;
         ensure!(
             !e.name.is_empty()
                 && !matches!(e.name.as_str(), "." | "..")
@@ -468,97 +512,14 @@ fn directory_entries(store: &Store, keys: &Keys, node: &Node) -> Result<Vec<Entr
 }
 
 pub fn restore(store: &Store, keys: &Keys, id: &str, destination: &Path) -> Result<()> {
-    let snapshot = load_snapshot(store, keys, id)?;
-    ensure!(
-        !destination.try_exists()? && fs::symlink_metadata(destination).is_err(),
-        "destination must not exist"
-    );
-    restore_node(store, keys, &snapshot.root, destination, 0)?;
-    if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
-}
-fn restore_node(store: &Store, keys: &Keys, node: &Node, path: &Path, depth: usize) -> Result<()> {
-    ensure!(depth <= MAX_DEPTH, "directory nesting limit exceeded");
-    ensure!(node.logical.mode <= 0o777, "unsupported permission bits");
-    match node.logical.kind.as_str() {
-        "directory" => {
-            let entries = directory_entries(store, keys, node)?;
-            fs::create_dir(path)?;
-            for e in entries {
-                restore_node(store, keys, &e.node, &path.join(e.name), depth + 1)?;
-            }
-            let dir = File::open(path)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(node.logical.mode))?;
-            dir.sync_all()?;
-        }
-        "file" => {
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(path)?;
-            let mut end = node.logical.size;
-            let mut next = node.recipe.clone();
-            let mut pages = 0usize;
-            while let Some(id) = next {
-                pages += 1;
-                ensure!(pages <= 1_000_000, "invalid file recipe chain");
-                let Page::File { previous, chunks } = get_page(store, keys, &id)? else {
-                    bail!("not a file page");
-                };
-                for c in chunks.iter().rev() {
-                    ensure!(
-                        c.len > 0
-                            && c.len <= MAX_CHUNK
-                            && c.offset.checked_add(c.len as u64) == Some(end),
-                        "invalid chunk coverage"
-                    );
-                    let (bytes, refs) = get_object(store, keys, &c.id)?;
-                    ensure!(
-                        refs.is_empty() && bytes.first() == Some(&b'C') && bytes.len() - 1 == c.len,
-                        "invalid chunk object"
-                    );
-                    file.seek(SeekFrom::Start(c.offset))?;
-                    file.write_all(&bytes[1..])?;
-                    end = c.offset;
-                }
-                next = previous;
-            }
-            ensure!(end == 0, "incomplete file recipe");
-            file.seek(SeekFrom::Start(0))?;
-            let mut hasher = blake3::Hasher::new();
-            let mut buffer = [0; 64 * 1024];
-            loop {
-                let n = file.read(&mut buffer)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..n]);
-            }
-            ensure!(
-                hasher.finalize().to_hex().as_str() == node.logical.digest,
-                "restored file hash mismatch"
-            );
-            file.set_permissions(fs::Permissions::from_mode(node.logical.mode))?;
-            file.sync_all()?;
-        }
-        "symlink" => {
-            let target = node
-                .logical
-                .target
-                .as_ref()
-                .context("missing symlink target")?;
-            ensure!(
-                blake3::hash(target.as_bytes()).to_hex().as_str() == node.logical.digest
-                    && target.len() as u64 == node.logical.size,
-                "symlink identity mismatch"
-            );
-            symlink(target, path)?;
-        }
-        _ => bail!("unsupported entry kind"),
-    }
+    crate::restore::run(
+        store,
+        keys,
+        id,
+        destination,
+        crate::restore::RestoreMode::New,
+        None,
+    )?;
     Ok(())
 }
 
@@ -573,6 +534,7 @@ pub fn snapshot_index(store: &Store, keys: &Keys, id: &str) -> Result<BTreeMap<S
         index: &mut BTreeMap<String, Logical>,
     ) -> Result<()> {
         ensure!(depth <= MAX_DEPTH, "directory nesting limit exceeded");
+        validate_node(node)?;
         index.insert(path.clone(), node.logical.clone());
         if node.logical.kind == "directory" {
             for e in directory_entries(store, keys, node)? {
@@ -624,4 +586,93 @@ pub fn differences(
     }
     result.sort_by(|a, b| a.1.cmp(&b.1));
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readers_reject_inconsistent_leaf_metadata_even_with_valid_object_hashes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let keys = Keys::from_bytes([37; 32]);
+        let store = Store::Local(temp.path().join("repo"));
+        let empty = Node {
+            logical: Logical {
+                kind: "file".into(),
+                mode: 0o600,
+                size: 0,
+                digest: blake3::hash(b"").to_hex().to_string(),
+                target: None,
+            },
+            recipe: None,
+        };
+        let mut inconsistent = Vec::new();
+        let mut node = empty.clone();
+        node.logical.kind = "unknown".into();
+        inconsistent.push(node);
+        let mut node = empty.clone();
+        node.logical.target = Some("unexpected".into());
+        inconsistent.push(node);
+        let mut node = empty.clone();
+        node.logical.mode = 0o4600;
+        inconsistent.push(node);
+        let mut node = empty.clone();
+        node.logical.size = 1;
+        inconsistent.push(node);
+        let mut node = empty;
+        node.logical.kind = "symlink".into();
+        node.logical.mode = 0o777;
+        node.logical.target = Some("target".into());
+        node.logical.size = 6;
+        // A valid directory hash cannot make an inconsistent symlink valid.
+        inconsistent.push(node);
+        for (i, node) in inconsistent.into_iter().enumerate() {
+            let mut h = directory_hasher(0o700);
+            hash_entry(&mut h, "leaf", &node.logical)?;
+            let page = Page::Directory {
+                previous: None,
+                entries: vec![Entry {
+                    name: "leaf".into(),
+                    node,
+                }],
+            };
+            let mut bytes = vec![b'M'];
+            bytes.extend(serde_json::to_vec(&page)?);
+            let recipe = keys.object_id(&bytes);
+            store.put(
+                &format!("objects/{recipe}"),
+                &keys.seal(&bytes, page.refs())?,
+            )?;
+            let root = Node {
+                logical: Logical {
+                    kind: "directory".into(),
+                    mode: 0o700,
+                    size: 0,
+                    digest: h.finalize().to_hex().to_string(),
+                    target: None,
+                },
+                recipe: Some(recipe.clone()),
+            };
+            let id = snapshot_id(&root.logical)?;
+            let snapshot = Snapshot {
+                version: 1,
+                id: id.clone(),
+                root,
+            };
+            store.put(
+                &format!("snapshots/{id}"),
+                &keys.seal(&serde_json::to_vec(&snapshot)?, vec![recipe])?,
+            )?;
+            assert!(verify(&store, &keys, &id).is_err(), "case {i}");
+            assert!(snapshot_index(&store, &keys, &id).is_err(), "case {i}");
+            let destination = temp.path().join(format!("restore-{i}"));
+            assert!(
+                restore(&store, &keys, &id, &destination).is_err(),
+                "case {i}"
+            );
+            assert!(!destination.exists());
+        }
+        Ok(())
+    }
 }

@@ -364,6 +364,7 @@ dependencies = [
  "rand 0.8.8",
  "reqwest",
  "russh",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

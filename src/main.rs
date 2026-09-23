@@ -3,6 +3,7 @@ use cairn::{
     capture::Source,
     chunking::Chunker,
     objects::Keys,
+    restore::{self, RestoreMode, Reuse},
     snapshot::{self, CaptureOptions},
     store::{Import, Store, replicate},
 };
@@ -59,10 +60,18 @@ enum Commands {
         #[arg(long,default_value_t=snapshot::DEFAULT_CHUNK)]
         chunk_size: usize,
     },
-    /// Restore into a directory which must not exist.
+    /// Restore into a new directory, or atomically swap a staged tree into place.
     Restore {
         snapshot: String,
         destination: PathBuf,
+        #[arg(long, value_enum, default_value = "new")]
+        mode: RestoreMode,
+        /// Local file reuse for swap mode (default: hash).
+        #[arg(long, value_enum)]
+        reuse: Option<Reuse>,
+        /// Print file counts and the retained old tree path as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Authenticate every reachable object without restoring files.
     Verify {
@@ -213,7 +222,22 @@ fn run() -> Result<()> {
         Commands::Restore {
             snapshot,
             destination,
-        } => snapshot::restore(&store, &keys, &store.resolve(&snapshot)?, &destination)?,
+            mode,
+            reuse,
+            json,
+        } => {
+            let stats = restore::run(
+                &store,
+                &keys,
+                &store.resolve(&snapshot)?,
+                &destination,
+                mode,
+                reuse,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string(&stats)?);
+            }
+        }
         Commands::Verify { snapshot } => {
             let count = snapshot::verify(&store, &keys, &store.resolve(&snapshot)?)?;
             println!("verified {count} objects");

@@ -63,5 +63,24 @@ fn bounded_roundtrip(chunker: &str) -> Result<()> {
         fs::metadata(destination.join("large"))?.len(),
         128 * 1024 * 1024
     );
+    let swap = Command::new("bash")
+        .args([
+            "-c",
+            "ulimit -v 98304; exec \"$1\" --repo \"$2\" --key-file \"$5\" restore \"$3\" \"$4\" --mode swap --json",
+            "cairn-memory-test",
+        ])
+        .arg(binary).arg(&repo).arg(&id).arg(&destination).arg(&key).output()?;
+    ensure!(
+        swap.status.success(),
+        "swap under 96 MiB address-space cap: {}",
+        String::from_utf8_lossy(&swap.stderr)
+    );
+    let stats: serde_json::Value = serde_json::from_slice(&swap.stdout)?;
+    assert_eq!(stats["hash_reused"], 1);
+    assert_eq!(stats["downloaded"], 0);
+    assert_eq!(
+        fs::metadata(destination.join("large"))?.len(),
+        128 * 1024 * 1024
+    );
     Ok(())
 }

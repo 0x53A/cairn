@@ -175,6 +175,74 @@ fn saved(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
 }
 
 #[test]
+fn killed_staged_restore_preserves_live_tree_and_retry_publishes() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let temp = tempfile::tempdir()?;
+    let source = fixture(temp.path())?;
+    let root = temp.path().join("server");
+    let store = Store::connect(root.to_str().unwrap(), "plain", None)?;
+    let id = snapshot::capture(
+        &store,
+        &Keys::default(),
+        &source,
+        &CaptureOptions::default(),
+    )?;
+    let (_server, url) = server(&root)?;
+    let gate = Gate::new(url, "GET")?;
+    let live = temp.path().join("live");
+    fs::create_dir(&live)?;
+    fs::write(live.join("keep"), b"original tree")?;
+    let inode = live.metadata()?.ino();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cairn"));
+        command
+            .args(["--repo", &gate.url, "restore", &id])
+            .arg(&live)
+            .args(["--mode", "swap", "--reuse", "never", "--json"])
+            .env_remove("CAIRN_TOKEN");
+        command
+    };
+    let mut child = Process(command().stdout(Stdio::null()).spawn()?);
+    gate.wait()?;
+    child.0.kill()?;
+    child.0.wait()?;
+    assert_eq!(live.metadata()?.ino(), inode);
+    assert_eq!(fs::read(live.join("keep"))?, b"original tree");
+    assert_eq!(fs::read_dir(&live)?.count(), 1);
+    let abandoned: Vec<_> = fs::read_dir(temp.path())?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".cairn-restore-")
+        })
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(abandoned.len(), 1);
+    gate.release()?;
+    let output = command().output()?;
+    ensure!(
+        output.status.success(),
+        "retry failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stats: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let displaced = Path::new(stats["displaced_tree"].as_str().unwrap());
+    assert_eq!(displaced.metadata()?.ino(), inode);
+    assert_eq!(fs::read(displaced.join("keep"))?, b"original tree");
+    assert_eq!(stats["downloaded"], 6);
+    assert!(
+        abandoned[0].exists(),
+        "retry must not sweep earlier staging trees"
+    );
+    assert_eq!(
+        snapshot::source_index(&Keys::default(), &live, &CaptureOptions::default())?,
+        snapshot::snapshot_index(&store, &Keys::default(), &id)?
+    );
+    Ok(())
+}
+
+#[test]
 fn killed_upload_reuses_committed_chunks_on_retry() -> Result<()> {
     for chunker in ["fixed", "fastcdc"] {
         killed_upload(chunker)?;

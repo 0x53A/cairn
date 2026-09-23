@@ -17,7 +17,7 @@ Linux/Unix implementation. See [the root AGENTS.md](../AGENTS.md) for setup and 
   sparse allocation layout are not preserved. File byte content is preserved.
 - Optional gitignore-style rules from `--ignore-file`; no implicit .gitignore walk.
 - Local or remote listing, unique immutable tags, file-level diff, restore into a
-  new directory, and diff against a source without ingesting that source.
+  new directory or opt-in atomic swap, and diff against a source without ingesting it.
 - Keyless opaque replication. With an HTTP(S) source and remote destination, the
   destination server pulls directly. The initiating client transfers a control
   request. Unix/SSH sources and local destinations use CLI-mediated replication.
@@ -112,9 +112,14 @@ hash-check objects when reading/restoring them. ENOSPC/quota errors map to HTTP
 507, other filesystem errors to 500.
 
 Interrupted capture/copy leaves unreferenced objects, which a retry reuses. There is
-no GC, deletion, resumable session journal or quota system yet. Restore may leave a
-partial destination on failure and always refuses an existing destination on a
-new invocation. No automatic overwrite, merge or rollback of an existing tree.
+no GC, deletion, resumable session journal or quota system yet. Default new-mode
+restore may leave a partial destination on failure and refuses an existing
+destination on a new invocation. Opt-in `restore --mode swap` stages and verifies
+a complete replacement, then atomically exchanges it with an existing directory
+and retains the old tree. Swap uses hash-checked local copies by default
+(`--reuse never` disables reuse), requires Linux openat2 and atomic exchange support,
+and leaves staging on failures. No in-place merge or automatic rollback is provided.
+See the [restore contract](restore/AGENTS.md).
 Power-loss guarantees have not been tested with fault injection.
 
 `verify SNAPSHOT_OR_TAG` checks snapshot/directory identities, authenticates and
@@ -288,10 +293,9 @@ Windows portability is low priority and is not part of this implementation.
 
 ## Future blocks
 
-Opt-in staged restore and dirty-tree update policies are specified in the
-[restore design](restore/AGENTS.md). They are proposed, not implemented; existing
-restore behavior remains unchanged. Timestamp-based reuse is an explicit heuristic,
-not proof of content identity.
+Opt-in staged swap restore with hash/never reuse is implemented; dirty-tree update,
+delete-extra and quick reuse remain specified in the [restore design](restore/AGENTS.md).
+Timestamp-based reuse would be an explicit heuristic, not proof of content identity.
 
 Read-only FUSE can resolve immutable manifests lazily with bounded chunk caching.
 A writable filesystem can add mutable working state and explicit durable checkpoint
@@ -302,6 +306,26 @@ Chunking research, pinned primary sources, reproducible benchmarks and the decis
 to offer FastCDC without changing the default: [chunking/AGENTS.md](chunking/AGENTS.md).
 Automatic per-file policies, compression and header-aware splitting need further
 workload evidence. Preserve logical identity and bounded memory in future changes.
+
+## Review and validation on 2026-09-22
+
+The ordinary suite passed with ten unit and twenty-six integration tests, plus
+the separately enabled SSH and bind-mount restore tests. Clippy with all targets
+and warnings denied passed. Staged restore tests cover hash/never reuse, old-tree
+retention, modes/type conflicts, symlinks and independent hard links, interrupted
+download/retry, and a 128 MiB file under a 96 MiB process address-space limit.
+The ordinary restore tests also passed with disposable fixtures on Btrfs.
+The Btrfs integration test was not rerun in this review: the available Btrfs mounts
+lack `user_subvol_rm_allowed`. Unsupported-exchange and power-loss fault injection
+remain untested.
+
+Shared logical-node validation now rejects unsupported kinds/permissions and
+inconsistent file/directory/symlink fields in verify, diff and restore. Verify no
+longer fetches each metadata object twice within its graph traversal. Live capture's
+Btrfs detection uses fstatfs rather than depending on an external stat executable.
+Restore builds directories privately with owner access even under restrictive umask,
+and new-directory restore and repository-directory creation synchronize the current
+directory when the destination uses a single relative path component.
 
 ## Validation on 2026-09-21
 

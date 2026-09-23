@@ -11,7 +11,8 @@ Do not edit human README files. AGENTS.md files are agent-maintained design note
 
 Independent immutable snapshots, optional E2E encryption (null means plaintext),
 unique string tags, local/HTTP stores (TCP, Unix socket, or client-managed SSH
-forward to a remote Unix socket), restore to a new directory, comparison,
+forward to a remote Unix socket), restore to a new directory or opt-in atomic
+directory swap, comparison,
 server-initiated replication of missing objects without client relay or E2E keys.
 `ssh://` embeds russh; `ssh-openssh://` uses the installed SSH client. Native SSH
 does not parse OpenSSH config; see design notes for identity/known_hosts options.
@@ -26,8 +27,10 @@ option. Its target is a power of two, 4 KiB–1 MiB; maximum chunk size is 4x ta
 See [chunking research](design/chunking/AGENTS.md) before changing boundary rules,
 defaults, file-type policies or dependencies. Golden fixtures protect cut points.
 
-Relationships between snapshots and mutation of existing working directories are
-out of scope. Later consumers: read-only FUSE with lazy chunk retrieval and bounded
+Relationships between snapshots and in-place updates of existing working directories
+remain out of scope for the current implementation. Swap restore retains the old
+tree; see design/restore/AGENTS.md for implemented and pending modes.
+Later consumers: read-only FUSE with lazy chunk retrieval and bounded
 optional caching; a writable filesystem that publishes snapshots at defined sync
 points.
 

@@ -158,10 +158,10 @@ impl Store {
         ensure!(bytes.len() <= MAX_OBJECT, "object too large");
         validate_value(key, bytes)?;
         match self {
-            Self::Ssh(_) => Ok(
-                self.ssh_request(reqwest::Method::PUT, key, bytes.to_vec())?.0
-                    == reqwest::StatusCode::CREATED,
-            ),
+            Self::Ssh(_) => Ok(self
+                .ssh_request(reqwest::Method::PUT, key, bytes.to_vec())?
+                .0
+                == reqwest::StatusCode::CREATED),
             Self::Local(root) => {
                 if key.starts_with("snapshots/") {
                     complete(self, envelope(bytes)?.0.refs)?;
@@ -270,7 +270,13 @@ impl Store {
     pub fn remote_import(&self, request: &Import) -> Result<TransferStats> {
         if matches!(self, Self::Ssh(_)) {
             return Ok(serde_json::from_slice(
-                &self.ssh_request(reqwest::Method::POST, "import", serde_json::to_vec(request)?)?.1,
+                &self
+                    .ssh_request(
+                        reqwest::Method::POST,
+                        "import",
+                        serde_json::to_vec(request)?,
+                    )?
+                    .1,
             )?);
         }
         ensure!(matches!(self, Self::Http { .. }), "destination is not HTTP");
@@ -336,9 +342,11 @@ fn durable_mkdir(path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
         Err(e) => return Err(e.into()),
     }
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        File::open(parent)?.sync_all()?;
-    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 
