@@ -73,6 +73,27 @@ fn live_cli_capture_restore_filter_diff_and_identity_without_btrfs_tools() -> Re
         }
         let store = Store::Local(repo.join(keys.domain()));
         assert_eq!(store.resolve("initial")?, id);
+        let encoded = store.get(&format!("snapshots/{id}"))?;
+        assert_eq!(
+            success(cli(
+                &repo,
+                key_path,
+                &["materialize", "initial", "--chunker", "fastcdc"]
+            )?)?,
+            id
+        );
+        assert_eq!(
+            store.get(&format!("snapshots/{id}"))?,
+            encoded,
+            "materializing an object-backed snapshot is idempotent"
+        );
+        let conflict = cli(
+            &repo,
+            key_path,
+            &["capture", src, "--live", "--backend", "btrfs"],
+        )?;
+        assert!(!conflict.status.success());
+        assert!(String::from_utf8_lossy(&conflict.stderr).contains("conflicts with --live"));
         let restored = temp.path().join(format!("restored-{name}"));
         success(cli(
             &repo,

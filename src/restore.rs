@@ -59,6 +59,7 @@ pub fn run(
     let mut writer = Writer {
         store,
         keys,
+        snapshot: &snapshot,
         old: None,
         stats: RestoreStats::default(),
     };
@@ -169,6 +170,7 @@ fn swap(_: &mut Writer<'_>, _: &Node, _: &Path, _: Reuse) -> Result<()> {
 struct Writer<'a> {
     store: &'a Store,
     keys: &'a Keys,
+    snapshot: &'a crate::snapshot::Snapshot,
     old: Option<File>,
     stats: RestoreStats,
 }
@@ -206,7 +208,18 @@ impl Writer<'_> {
                 let reused = self.reuse(node, relative, &mut file)?;
                 if !reused {
                     file.set_len(0)?;
-                    restore_file(self.store, self.keys, node, &mut file)?;
+                    if self.snapshot.backing.is_some() {
+                        let input = self
+                            .snapshot
+                            .backed_file(self.store, self.keys, node, relative)?;
+                        std::io::copy(
+                            &mut input.take(node.logical.size.saturating_add(1)),
+                            &mut file,
+                        )?;
+                        verify_file(&mut file, node)?;
+                    } else {
+                        restore_file(self.store, self.keys, node, &mut file)?;
+                    }
                 }
                 file.set_permissions(fs::Permissions::from_mode(node.logical.mode))?;
                 file.sync_all()?;

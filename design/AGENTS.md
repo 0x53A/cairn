@@ -1,6 +1,7 @@
 # Cairn PoC contract and operations
 
-Format version 1 is experimental; do not promise backward compatibility yet.
+Portable format version 1 is experimental; local retained-Btrfs records use version
+2 with unchanged logical identity. Do not promise backward compatibility yet.
 Linux/Unix implementation. See [the root AGENTS.md](../AGENTS.md) for setup and a quick start.
 
 ## Implemented scope
@@ -9,6 +10,10 @@ Linux/Unix implementation. See [the root AGENTS.md](../AGENTS.md) for setup and 
 - Btrfs capture creates a temporary read-only snapshot of the containing subvolume,
   selects the requested subtree and reads directly from it. There is no local
   archive, object repository or payload spool on the HTTP client.
+- Opt-in `capture --backend btrfs` retains the subvolume as local payload storage,
+  writing only metadata. Restore/verify read it directly; key-holding local copy
+  exports portable objects. `materialize` converts to ordinary objects without
+  changing identity or tags. See the [backing contract](backing/AGENTS.md).
 - `--live` explicitly bypasses Btrfs for quiescent ordinary directories. It detects
   some concurrent file modifications but cannot provide an atomic multi-file view.
 - Regular files, empty directories, symlinks, UTF-8 names/targets and Unix rwx mode
@@ -45,8 +50,12 @@ entries, linked to their preceding page, allowing upload without retaining a who
 file's manifest. Snapshot records hold the logical root and its recipe reference.
 The first complete representation of a snapshot ID wins if another capture uses
 different chunk boundaries. Later extra objects may remain unreferenced.
+Explicit materialization can atomically replace a retained Btrfs representation
+with a complete portable representation under the same ID; ordinary capture and
+replication still never overwrite snapshot records.
 
 Physical layout: `<repository>/<domain>/{objects,snapshots,tags}/<id>`.
+Retained backends additionally use `backings` and persistent `backing-locks`.
 Object IDs hash typed plaintext payloads (keyed in encrypted domains). Tags are
 UTF-8 strings encoded as hex filenames, 1–120 bytes, unique per domain/repository.
 A tag can be assigned idempotently to the same snapshot; moving/deleting tags is
@@ -125,7 +134,8 @@ Power-loss guarantees have not been tested with fault injection.
 `verify SNAPSHOT_OR_TAG` checks snapshot/directory identities, authenticates and
 hash-checks all reachable objects, and validates metadata page references, without
 writing a restored tree. It requires the E2E key for an encrypted repository. It
-does not reconstruct whole files to check their logical digest/coverage; restore
+hashes whole files for retained Btrfs backing. For portable chunk storage it does
+not reconstruct whole files to check their logical digest/coverage; restore
 performs those additional checks. Corruption fails explicitly and is never silently
 overwritten. To repair, preserve/quarantine the identified damaged object outside
 the repository, then retry capture from intact original files (with the same
@@ -141,7 +151,8 @@ through capture; cleanup clears its read-only property immediately before deleti
 it, because unprivileged deletion otherwise fails with `Read-only file system`.
 The adapter does not invoke sudo, change mounts, stop processes or freeze a whole
 filesystem. Use `--snapshot-dir` for an existing suitable directory on the same
-filesystem. Capture-owned snapshots are deleted on normal success/error. SIGKILL
+filesystem. Temporary capture snapshots are deleted on normal success/error.
+Retained captures transfer ownership to `.cairn-retained-*` subvolumes. SIGKILL
 or power loss can leave `.cairn-capture-*` snapshots; stderr reports their paths.
 New captures create an adjacent `.lock` intent record and hold an advisory file
 lock throughout capture. `cleanup-snapshots --snapshot-dir DIR` removes abandoned

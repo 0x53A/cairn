@@ -1,4 +1,5 @@
 use crate::{
+    backing::{self, BtrfsBacking, Lease},
     chunking::Chunker,
     objects::{Keys, valid_id},
     store::Store,
@@ -90,6 +91,9 @@ pub struct Chunk {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Page {
+    BtrfsFile {
+        path: String,
+    },
     File {
         previous: Option<String>,
         chunks: Vec<Chunk>,
@@ -103,6 +107,7 @@ impl Page {
     fn refs(&self) -> Vec<String> {
         let mut result = Vec::new();
         match self {
+            Self::BtrfsFile { .. } => {}
             Self::File { previous, chunks } => {
                 result.extend(previous.iter().cloned());
                 result.extend(chunks.iter().map(|c| c.id.clone()));
@@ -120,6 +125,10 @@ pub struct Snapshot {
     pub version: u32,
     pub id: String,
     pub root: Node,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing: Option<BtrfsBacking>,
+    #[serde(skip)]
+    pub(crate) lease: Option<Lease>,
 }
 
 fn snapshot_id(root: &Logical) -> Result<String> {
@@ -141,12 +150,37 @@ fn hash_entry(h: &mut blake3::Hasher, name: &str, logical: &Logical) -> Result<(
     Ok(())
 }
 
+/// Retained snapshots hold a read lease until the returned value is dropped.
+/// Drop that value before materializing the same snapshot in this process.
 pub fn load_snapshot(store: &Store, keys: &Keys, id: &str) -> Result<Snapshot> {
     ensure!(valid_id(id), "invalid snapshot ID");
-    let (bytes, refs) = keys.open(&store.get(&format!("snapshots/{id}"))?)?;
-    let snap: Snapshot = serde_json::from_slice(&bytes)?;
+    // Portable records never change backing again. Keep ordinary repositories
+    // readable without write permission or creating lock files on every read.
+    let encoded = store.get(&format!("snapshots/{id}"))?;
+    if !crate::objects::envelope(&encoded)?.0.local {
+        return decode_snapshot(store, keys, id, &encoded);
+    }
+    let lock = backing::lock(store, id, false)?;
+    let mut snap = load_unlocked(store, keys, id)?;
+    snap.lease.as_mut().unwrap()._lock = lock;
+    Ok(snap)
+}
+
+fn load_unlocked(store: &Store, keys: &Keys, id: &str) -> Result<Snapshot> {
+    ensure!(valid_id(id), "invalid snapshot ID");
+    let encoded = store.get(&format!("snapshots/{id}"))?;
+    decode_snapshot(store, keys, id, &encoded)
+}
+
+fn decode_snapshot(store: &Store, keys: &Keys, id: &str, encoded: &[u8]) -> Result<Snapshot> {
+    let local = crate::objects::envelope(encoded)?.0.local;
+    let (bytes, refs) = keys.open(encoded)?;
+    let mut snap: Snapshot = serde_json::from_slice(&bytes)?;
     ensure!(
-        snap.version == 1 && snap.id == id && snapshot_id(&snap.root.logical)? == id,
+        snap.version == if local { 2 } else { 1 }
+            && local == snap.backing.is_some()
+            && snap.id == id
+            && snapshot_id(&snap.root.logical)? == id,
         "snapshot identity mismatch"
     );
     ensure!(
@@ -158,6 +192,16 @@ pub fn load_snapshot(store: &Store, keys: &Keys, id: &str) -> Result<Snapshot> {
         "snapshot root is not a directory"
     );
     validate_node(&snap.root)?;
+    let root = if let Some(backing) = &snap.backing {
+        ensure!(
+            matches!(store, Store::Local(_)),
+            "Btrfs backing is local-only"
+        );
+        Some(backing.open()?)
+    } else {
+        None
+    };
+    snap.lease = Some(Lease { root, _lock: None });
     Ok(snap)
 }
 
@@ -165,9 +209,16 @@ pub fn load_snapshot(store: &Store, keys: &Keys, id: &str) -> Result<Snapshot> {
 /// Restore additionally verifies each reconstructed whole-file digest.
 pub fn verify(store: &Store, keys: &Keys, id: &str) -> Result<usize> {
     let snapshot = load_snapshot(store, keys, id)?;
+    verify_loaded(store, keys, &snapshot)
+}
+
+fn verify_loaded(store: &Store, keys: &Keys, snapshot: &Snapshot) -> Result<usize> {
     // Validate directory identities and names as well as the opaque graph.
-    snapshot_index(store, keys, id)?;
-    let mut pending: Vec<_> = snapshot.root.recipe.into_iter().collect();
+    index_loaded(store, keys, snapshot)?;
+    if snapshot.backing.is_some() {
+        verify_backed_tree(store, keys, snapshot, &snapshot.root, Path::new(""), 0)?;
+    }
+    let mut pending: Vec<_> = snapshot.root.recipe.iter().cloned().collect();
     let mut seen = HashSet::new();
     while let Some(id) = pending.pop() {
         if !seen.insert(id.clone()) {
@@ -181,7 +232,11 @@ pub fn verify(store: &Store, keys: &Keys, id: &str) -> Result<usize> {
             get_object(store, keys, &id).with_context(|| format!("verify object {id}"))?;
         match payload.first() {
             Some(b'M') => {
-                decode_page(&payload, &refs)?;
+                let page = decode_page(&payload, &refs)?;
+                ensure!(
+                    snapshot.backing.is_some() || !matches!(page, Page::BtrfsFile { .. }),
+                    "portable snapshot contains a local backing recipe"
+                );
             }
             Some(b'C') => ensure!(refs.is_empty(), "chunk has references"),
             _ => bail!("invalid object type: {id}"),
@@ -208,6 +263,7 @@ fn decode_page(bytes: &[u8], refs: &[String]) -> Result<Page> {
     let page: Page = serde_json::from_slice(&bytes[1..])?;
     ensure!(page.refs() == refs, "metadata references mismatch");
     match &page {
+        Page::BtrfsFile { path } => backing::relative(Path::new(path), false)?,
         Page::File { chunks, .. } => ensure!(
             !chunks.is_empty() && chunks.len() <= PAGE_ENTRIES,
             "invalid file page size"
@@ -249,12 +305,337 @@ pub fn capture(
         version: 1,
         id: id.clone(),
         root,
+        backing: None,
+        lease: None,
     };
     store.put(
         &format!("snapshots/{id}"),
         &keys.seal(&serde_json::to_vec(&snap)?, refs)?,
     )?;
     Ok(id)
+}
+
+/// Capture logical metadata and retain the read-only Btrfs subvolume as payload.
+pub fn capture_btrfs(
+    store: &Store,
+    keys: &Keys,
+    source: &Path,
+    snapshot_dir: Option<&Path>,
+    options: &CaptureOptions,
+) -> Result<String> {
+    let Store::Local(repo) = store else {
+        bail!("Btrfs backing requires a local repository")
+    };
+    options.chunker.validate(options.chunk_size)?;
+    crate::store::durable_mkdir(repo)?;
+    ensure!(
+        !fs::canonicalize(repo)?.starts_with(fs::canonicalize(source)?),
+        "repository must be outside the captured directory"
+    );
+    let default_dir = repo.join("backings");
+    let snapshot_dir = match snapshot_dir {
+        Some(dir) => dir,
+        None => {
+            crate::store::durable_mkdir(&default_dir)?;
+            &default_dir
+        }
+    };
+    let source = crate::capture::Source::open(source, false, Some(snapshot_dir))?;
+    let mut builder = Builder::new(Some(store), keys, &source.path, options, false)?;
+    builder.retained = true;
+    let root = builder.visit(&builder.root.clone(), 0)?;
+    let id = snapshot_id(&root.logical)?;
+    let _lock = backing::lock(store, &id, true)?;
+    if store.exists(&format!("snapshots/{id}"))? {
+        verify_loaded(store, keys, &load_unlocked(store, keys, &id)?)?;
+        source.finish()?;
+        return Ok(id);
+    }
+    let backing = source.retain()?;
+    let snapshot = Snapshot {
+        version: 2,
+        id: id.clone(),
+        root,
+        backing: Some(backing),
+        lease: None,
+    };
+    let refs = snapshot.root.recipe.iter().cloned().collect();
+    store.put_local(
+        &format!("snapshots/{id}"),
+        &keys.seal_local(&serde_json::to_vec(&snapshot)?, refs)?,
+    )?;
+    Ok(id)
+}
+
+impl Snapshot {
+    pub(crate) fn backed_file(
+        &self,
+        store: &Store,
+        keys: &Keys,
+        node: &Node,
+        path: &Path,
+    ) -> Result<File> {
+        let root = self
+            .lease
+            .as_ref()
+            .and_then(|l| l.root.as_ref())
+            .context("file requires a retained Btrfs backing")?;
+        validate_node(node)?;
+        if let Some(id) = &node.recipe {
+            let Page::BtrfsFile { path: stored } = get_page(store, keys, id)? else {
+                bail!("not a Btrfs file recipe");
+            };
+            ensure!(
+                Path::new(&stored) == path,
+                "Btrfs file recipe path mismatch"
+            );
+        }
+        let file = backing::open_beneath(root, path, false)?;
+        ensure!(
+            file.metadata()?.len() == node.logical.size,
+            "backing file size mismatch"
+        );
+        Ok(file)
+    }
+}
+
+fn verify_backed_tree(
+    store: &Store,
+    keys: &Keys,
+    snapshot: &Snapshot,
+    node: &Node,
+    path: &Path,
+    depth: usize,
+) -> Result<()> {
+    ensure!(depth <= MAX_DEPTH, "directory nesting limit exceeded");
+    match node.logical.kind.as_str() {
+        "directory" => {
+            for entry in directory_entries(store, keys, node)? {
+                verify_backed_tree(
+                    store,
+                    keys,
+                    snapshot,
+                    &entry.node,
+                    &path.join(entry.name),
+                    depth + 1,
+                )?;
+            }
+        }
+        "file" => {
+            let mut file = snapshot.backed_file(store, keys, node, path)?;
+            let mut h = blake3::Hasher::new();
+            let mut size = 0u64;
+            for bytes in
+                Chunker::Fixed.chunks_for_file(&mut file, DEFAULT_CHUNK, Some(node.logical.size))?
+            {
+                let bytes = bytes?;
+                size += bytes.len() as u64;
+                h.update(&bytes);
+            }
+            ensure!(
+                size == node.logical.size && h.finalize().to_hex().as_str() == node.logical.digest,
+                "backing file hash mismatch: {}",
+                path.display()
+            );
+        }
+        "symlink" => {}
+        _ => bail!("unsupported entry kind"),
+    }
+    Ok(())
+}
+
+/// Convert a local backing to ordinary objects, keeping the logical ID and tags.
+pub fn materialize(store: &Store, keys: &Keys, id: &str, options: &CaptureOptions) -> Result<()> {
+    ensure!(
+        matches!(store, Store::Local(_)),
+        "materialize requires a local repository"
+    );
+    options.chunker.validate(options.chunk_size)?;
+    let _lock = backing::lock(store, id, true)?;
+    let snapshot = load_unlocked(store, keys, id)?;
+    let Some(backing) = snapshot.backing.clone() else {
+        verify_loaded(store, keys, &snapshot)?;
+        return Ok(());
+    };
+    let (portable, _) = export_tree(store, store, keys, &snapshot, options)?;
+    let refs = portable.root.recipe.iter().cloned().collect();
+    store.replace_snapshot(id, &keys.seal(&serde_json::to_vec(&portable)?, refs)?)?;
+    drop(snapshot);
+    backing.release().with_context(|| {
+        format!(
+            "snapshot {id} is materialized; old backing remains at {} (release failed)",
+            backing.path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Stream a retained snapshot into the portable format, encrypting before upload.
+/// No payload spool and no mutation of the source backing are required.
+pub fn copy_btrfs(
+    source: &Store,
+    destination: &Store,
+    keys: &Keys,
+    id: &str,
+    options: &CaptureOptions,
+) -> Result<crate::store::TransferStats> {
+    options.chunker.validate(options.chunk_size)?;
+    let snapshot = load_snapshot(source, keys, id)?;
+    if snapshot.backing.is_none() {
+        drop(snapshot);
+        return crate::store::replicate(source, destination, id);
+    }
+    let (portable, stats) = export_tree(source, destination, keys, &snapshot, options)?;
+    let refs = portable.root.recipe.iter().cloned().collect();
+    // No source data is needed after this point. Release the read lock before
+    // publication, including when a remote endpoint serves the source repository.
+    drop(snapshot);
+    destination.put(
+        &format!("snapshots/{id}"),
+        &keys.seal(&serde_json::to_vec(&portable)?, refs)?,
+    )?;
+    Ok(stats)
+}
+
+fn export_tree(
+    source: &Store,
+    destination: &Store,
+    keys: &Keys,
+    snapshot: &Snapshot,
+    options: &CaptureOptions,
+) -> Result<(Snapshot, crate::store::TransferStats)> {
+    let mut exporter = Exporter {
+        source,
+        destination,
+        keys,
+        snapshot,
+        options,
+        stats: crate::store::TransferStats::default(),
+    };
+    let root = exporter.node(&snapshot.root, Path::new(""), 0)?;
+    ensure!(
+        snapshot_id(&root.logical)? == snapshot.id,
+        "conversion changed snapshot identity"
+    );
+    Ok((
+        Snapshot {
+            version: 1,
+            id: snapshot.id.clone(),
+            root,
+            backing: None,
+            lease: None,
+        },
+        exporter.stats,
+    ))
+}
+
+struct Exporter<'a> {
+    source: &'a Store,
+    destination: &'a Store,
+    keys: &'a Keys,
+    snapshot: &'a Snapshot,
+    options: &'a CaptureOptions,
+    stats: crate::store::TransferStats,
+}
+impl Exporter<'_> {
+    fn object(&mut self, payload: &[u8], refs: Vec<String>) -> Result<String> {
+        let id = self.keys.object_id(payload);
+        let key = format!("objects/{id}");
+        if self.destination.exists(&key)? {
+            self.stats.objects_present += 1;
+        } else {
+            let encoded = self.keys.seal(payload, refs)?;
+            if self.destination.put(&key, &encoded)? {
+                self.stats.objects_copied += 1;
+                self.stats.bytes_copied += encoded.len() as u64;
+            } else {
+                self.stats.objects_present += 1;
+            }
+        }
+        Ok(id)
+    }
+    fn page(&mut self, page: &Page) -> Result<String> {
+        let mut payload = vec![b'M'];
+        payload.extend(serde_json::to_vec(page)?);
+        self.object(&payload, page.refs())
+    }
+    fn node(&mut self, node: &Node, path: &Path, depth: usize) -> Result<Node> {
+        ensure!(depth <= MAX_DEPTH, "directory nesting limit exceeded");
+        validate_node(node)?;
+        let mut previous = None;
+        match node.logical.kind.as_str() {
+            "directory" => {
+                let mut entries = Vec::new();
+                for entry in directory_entries(self.source, self.keys, node)? {
+                    entries.push(Entry {
+                        node: self.node(&entry.node, &path.join(&entry.name), depth + 1)?,
+                        name: entry.name,
+                    });
+                    if entries.len() == PAGE_ENTRIES {
+                        previous = Some(self.page(&Page::Directory {
+                            previous: previous.take(),
+                            entries: std::mem::take(&mut entries),
+                        })?);
+                    }
+                }
+                if !entries.is_empty() {
+                    previous = Some(self.page(&Page::Directory {
+                        previous: previous.take(),
+                        entries,
+                    })?);
+                }
+            }
+            "file" => {
+                let mut file = self
+                    .snapshot
+                    .backed_file(self.source, self.keys, node, path)?;
+                let mut h = blake3::Hasher::new();
+                let mut size = 0u64;
+                let mut chunks = Vec::new();
+                for bytes in self.options.chunker.chunks_for_file(
+                    &mut file,
+                    self.options.chunk_size,
+                    Some(node.logical.size),
+                )? {
+                    let bytes = bytes?;
+                    h.update(&bytes);
+                    let mut payload = Vec::with_capacity(bytes.len() + 1);
+                    payload.push(b'C');
+                    payload.extend_from_slice(&bytes);
+                    chunks.push(Chunk {
+                        id: self.object(&payload, vec![])?,
+                        offset: size,
+                        len: bytes.len(),
+                    });
+                    size += bytes.len() as u64;
+                    if chunks.len() == PAGE_ENTRIES {
+                        previous = Some(self.page(&Page::File {
+                            previous: previous.take(),
+                            chunks: std::mem::take(&mut chunks),
+                        })?);
+                    }
+                }
+                ensure!(
+                    size == node.logical.size
+                        && h.finalize().to_hex().as_str() == node.logical.digest,
+                    "backing file hash mismatch: {}",
+                    path.display()
+                );
+                if !chunks.is_empty() {
+                    previous = Some(self.page(&Page::File {
+                        previous: previous.take(),
+                        chunks,
+                    })?);
+                }
+            }
+            "symlink" => {}
+            _ => bail!("unsupported entry kind"),
+        }
+        Ok(Node {
+            logical: node.logical.clone(),
+            recipe: previous,
+        })
+    }
 }
 
 struct Builder<'a> {
@@ -268,6 +649,7 @@ struct Builder<'a> {
     collect: bool,
     index: BTreeMap<String, Logical>,
     btrfs: bool,
+    retained: bool,
 }
 impl<'a> Builder<'a> {
     fn new(
@@ -298,6 +680,7 @@ impl<'a> Builder<'a> {
             collect,
             index: BTreeMap::new(),
             btrfs,
+            retained: false,
         })
     }
     fn object(&self, payload: &[u8], refs: Vec<String>) -> Result<String> {
@@ -313,7 +696,18 @@ impl<'a> Builder<'a> {
     fn page(&self, page: &Page) -> Result<String> {
         let mut payload = vec![b'M'];
         payload.extend(serde_json::to_vec(page)?);
-        self.object(&payload, page.refs())
+        if matches!(page, Page::BtrfsFile { .. }) {
+            let id = self.keys.object_id(&payload);
+            self.store
+                .context("backing page requires storage")?
+                .put_local(
+                    &format!("objects/{id}"),
+                    &self.keys.seal_local(&payload, page.refs())?,
+                )?;
+            Ok(id)
+        } else {
+            self.object(&payload, page.refs())
+        }
     }
     fn visit(&mut self, path: &Path, depth: usize) -> Result<Node> {
         ensure!(depth <= MAX_DEPTH, "directory nesting exceeds {MAX_DEPTH}");
@@ -327,7 +721,7 @@ impl<'a> Builder<'a> {
             let mut previous = None;
             // Comparison only needs the whole-file hash, so it need not scan
             // for chunk boundaries or know the stored snapshot's chunker.
-            let read_mode = if self.store.is_some() {
+            let read_mode = if self.store.is_some() && !self.retained {
                 self.chunker
             } else {
                 Chunker::Fixed
@@ -336,7 +730,7 @@ impl<'a> Builder<'a> {
                 let buffer = buffer?;
                 let n = buffer.len();
                 hasher.update(&buffer);
-                if self.store.is_some() {
+                if self.store.is_some() && !self.retained {
                     let mut payload = Vec::with_capacity(n + 1);
                     payload.push(b'C');
                     payload.extend_from_slice(&buffer);
@@ -369,6 +763,17 @@ impl<'a> Builder<'a> {
                 "source changed while reading {}",
                 path.display()
             );
+            if self.retained && size != 0 {
+                previous = Some(
+                    self.page(&Page::BtrfsFile {
+                        path: path
+                            .strip_prefix(&self.root)?
+                            .to_str()
+                            .context("non-UTF-8 backing path")?
+                            .into(),
+                    })?,
+                );
+            }
             Node {
                 logical: Logical {
                     kind: "file".into(),
@@ -525,6 +930,10 @@ pub fn restore(store: &Store, keys: &Keys, id: &str, destination: &Path) -> Resu
 
 pub fn snapshot_index(store: &Store, keys: &Keys, id: &str) -> Result<BTreeMap<String, Logical>> {
     let snap = load_snapshot(store, keys, id)?;
+    index_loaded(store, keys, &snap)
+}
+
+fn index_loaded(store: &Store, keys: &Keys, snap: &Snapshot) -> Result<BTreeMap<String, Logical>> {
     fn walk(
         store: &Store,
         keys: &Keys,
@@ -593,6 +1002,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retained_metadata_exports_filtered_content_and_rejects_changed_bytes() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source");
+        fs::create_dir(&source)?;
+        fs::create_dir(source.join("empty-dir"))?;
+        fs::write(source.join("empty"), [])?;
+        fs::write(source.join("ignored"), "not exported")?;
+        symlink("missing", source.join("link"))?;
+        fs::write(source.join("large"), vec![47u8; 1024 * 1024])?;
+        for i in 0..140 {
+            fs::write(source.join(format!("file-{i:03}")), format!("file {i}"))?;
+        }
+        let ignore = temp.path().join("ignore");
+        fs::write(&ignore, "ignored\n")?;
+        for secret in [[0; 32], [19; 32]] {
+            let keys = Keys::from_bytes(secret);
+            let store = Store::Local(temp.path().join(keys.domain()).join("retained"));
+            let options = CaptureOptions {
+                ignore_file: Some(ignore.clone()),
+                ..Default::default()
+            };
+            let mut builder = Builder::new(Some(&store), &keys, &source, &options, false)?;
+            builder.retained = true;
+            let root = builder.visit(&builder.root.clone(), 0)?;
+            let id = snapshot_id(&root.logical)?;
+            let snap = Snapshot {
+                version: 2,
+                id: id.clone(),
+                root,
+                // Exercise the representation independently of the Btrfs ioctl;
+                // real identity checks are covered by tests/retained_btrfs.rs.
+                backing: Some(BtrfsBacking {
+                    path: source.clone(),
+                    subtree: PathBuf::new(),
+                    filesystem_uuid: String::new(),
+                    subvolume_uuid: String::new(),
+                    subvolume_id: 0,
+                }),
+                lease: Some(Lease {
+                    root: Some(File::open(&source)?),
+                    _lock: None,
+                }),
+            };
+            let encoded = keys.seal_local(
+                &serde_json::to_vec(&snap)?,
+                snap.root.recipe.iter().cloned().collect(),
+            )?;
+            assert!(store.put(&format!("snapshots/{id}"), &encoded).is_err());
+            store.put_local(&format!("snapshots/{id}"), &encoded)?;
+            let opaque_dest = Store::Local(temp.path().join(keys.domain()).join("opaque"));
+            assert!(crate::store::replicate(&store, &opaque_dest, &id).is_err());
+            assert!(opaque_dest.list("snapshots")?.is_empty());
+            for entry in fs::read_dir(match &store {
+                Store::Local(p) => p.join("objects"),
+                _ => unreachable!(),
+            })? {
+                let bytes = fs::read(entry?.path())?;
+                assert_eq!(
+                    keys.open(&bytes)?.0[0],
+                    b'M',
+                    "retention must not store payload chunks"
+                );
+            }
+            verify_loaded(&store, &keys, &snap)?;
+            let ordinary = Store::Local(temp.path().join(keys.domain()).join("ordinary"));
+            assert_eq!(capture(&ordinary, &keys, &source, &options)?, id);
+            for chunker in [Chunker::Fixed, Chunker::FastCdc] {
+                let destination = Store::Local(
+                    temp.path()
+                        .join(keys.domain())
+                        .join(format!("export-{chunker:?}")),
+                );
+                let conversion = CaptureOptions {
+                    chunker,
+                    chunk_size: 4096,
+                    ignore_file: None,
+                };
+                let (exported, stats) =
+                    export_tree(&store, &destination, &keys, &snap, &conversion)?;
+                assert!(stats.objects_copied > 0);
+                let refs = exported.root.recipe.iter().cloned().collect();
+                destination.put(
+                    &format!("snapshots/{id}"),
+                    &keys.seal(&serde_json::to_vec(&exported)?, refs)?,
+                )?;
+                verify(&destination, &keys, &id)?;
+                let restored = temp
+                    .path()
+                    .join(keys.domain())
+                    .join(format!("restored-{chunker:?}"));
+                restore(&destination, &keys, &id, &restored)?;
+                assert!(!restored.join("ignored").exists());
+                assert_eq!(
+                    fs::read(restored.join("large"))?,
+                    fs::read(source.join("large"))?
+                );
+                assert_eq!(fs::read_link(restored.join("link"))?, Path::new("missing"));
+                assert_eq!(
+                    snapshot_index(&ordinary, &keys, &id)?,
+                    snapshot_index(&destination, &keys, &id)?
+                );
+            }
+            fs::write(source.join("large"), vec![48u8; 1024 * 1024])?;
+            assert!(verify_loaded(&store, &keys, &snap).is_err());
+            let failed = Store::Local(temp.path().join(keys.domain()).join("failed"));
+            assert!(export_tree(&store, &failed, &keys, &snap, &options).is_err());
+            assert!(failed.list("snapshots")?.is_empty());
+            fs::write(source.join("large"), vec![47u8; 1024 * 1024])?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn readers_reject_inconsistent_leaf_metadata_even_with_valid_object_hashes() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let keys = Keys::from_bytes([37; 32]);
@@ -659,6 +1182,8 @@ mod tests {
                 version: 1,
                 id: id.clone(),
                 root,
+                backing: None,
+                lease: None,
             };
             store.put(
                 &format!("snapshots/{id}"),

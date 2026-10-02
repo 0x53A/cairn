@@ -7,7 +7,7 @@ use cairn::{
     snapshot::{self, CaptureOptions},
     store::{Import, Store, replicate},
 };
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rand::RngCore;
 use std::{
     fs::{self, OpenOptions},
@@ -43,6 +43,9 @@ enum Commands {
     /// Capture through a temporary read-only Btrfs snapshot by default.
     Capture {
         source: PathBuf,
+        /// Store chunks (default), or retain a local read-only Btrfs snapshot.
+        #[arg(long, value_enum, default_value = "objects")]
+        backend: CaptureBackend,
         #[arg(long)]
         tag: Vec<String>,
         /// Read files directly on any supported filesystem; no atomic directory view.
@@ -76,6 +79,14 @@ enum Commands {
     /// Authenticate every reachable object without restoring files.
     Verify {
         snapshot: String,
+    },
+    /// Convert a retained Btrfs snapshot to ordinary objects, preserving its ID and tags.
+    Materialize {
+        snapshot: String,
+        #[arg(long, value_enum, default_value = "fixed")]
+        chunker: Chunker,
+        #[arg(long, default_value_t = snapshot::DEFAULT_CHUNK)]
+        chunk_size: usize,
     },
     /// Remove abandoned Cairn Btrfs snapshots; active captures are skipped.
     CleanupSnapshots {
@@ -116,6 +127,11 @@ enum Commands {
         domain: Option<String>,
         #[arg(long)]
         tag: Vec<String>,
+        /// Splitter when exporting a local Btrfs backing.
+        #[arg(long, value_enum, default_value = "fixed")]
+        chunker: Chunker,
+        #[arg(long, default_value_t = snapshot::DEFAULT_CHUNK)]
+        chunk_size: usize,
     },
     /// Serve repository data. This process needs no E2E key.
     Serve {
@@ -125,6 +141,11 @@ enum Commands {
         #[arg(long)]
         unix_socket: Option<PathBuf>,
     },
+}
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CaptureBackend {
+    Objects,
+    Btrfs,
 }
 fn main() {
     if let Err(error) = run() {
@@ -185,6 +206,7 @@ fn run() -> Result<()> {
         Commands::Domain => println!("{}", keys.domain()),
         Commands::Capture {
             source,
+            backend,
             tag,
             live,
             snapshot_dir,
@@ -202,22 +224,35 @@ fn run() -> Result<()> {
                     "repository must be outside the captured directory"
                 );
             }
-            let source = Source::open(&source, live, snapshot_dir.as_deref())?;
-            let id = snapshot::capture(
-                &store,
-                &keys,
-                &source.path,
-                &CaptureOptions {
-                    chunker,
-                    chunk_size,
-                    ignore_file,
-                },
-            )?;
+            let options = CaptureOptions {
+                chunker,
+                chunk_size,
+                ignore_file,
+            };
+            let (id, temporary) = if backend == CaptureBackend::Btrfs {
+                ensure!(!live, "--backend btrfs conflicts with --live");
+                (
+                    snapshot::capture_btrfs(
+                        &store,
+                        &keys,
+                        &source,
+                        snapshot_dir.as_deref(),
+                        &options,
+                    )?,
+                    None,
+                )
+            } else {
+                let source = Source::open(&source, live, snapshot_dir.as_deref())?;
+                let id = snapshot::capture(&store, &keys, &source.path, &options)?;
+                (id, Some(source))
+            };
             println!("{id}");
             for name in tag {
                 store.tag(&name, &id)?;
             }
-            source.finish()?;
+            if let Some(source) = temporary {
+                source.finish()?;
+            }
         }
         Commands::Restore {
             snapshot,
@@ -241,6 +276,24 @@ fn run() -> Result<()> {
         Commands::Verify { snapshot } => {
             let count = snapshot::verify(&store, &keys, &store.resolve(&snapshot)?)?;
             println!("verified {count} objects");
+        }
+        Commands::Materialize {
+            snapshot,
+            chunker,
+            chunk_size,
+        } => {
+            let id = store.resolve(&snapshot)?;
+            snapshot::materialize(
+                &store,
+                &keys,
+                &id,
+                &CaptureOptions {
+                    chunker,
+                    chunk_size,
+                    ignore_file: None,
+                },
+            )?;
+            println!("{id}");
         }
         Commands::Diff { before, after } => {
             let a = snapshot::snapshot_index(&store, &keys, &store.resolve(&before)?)?;
@@ -281,16 +334,42 @@ fn run() -> Result<()> {
         }
         Commands::Tag { snapshot, name } => store.tag(&name, &store.resolve(&snapshot)?)?,
         Commands::Copy {
-            snapshot, to, tag, ..
+            snapshot,
+            to,
+            tag,
+            chunker,
+            chunk_size,
+            ..
         } => {
             let id = store.resolve(&snapshot)?;
             let destination = Store::connect(&to, &domain, std::env::var("CAIRN_DEST_TOKEN").ok())?;
             // Unix source paths belong to this client, not the destination host.
-            let stats = if (cli.repo.starts_with("http://") || cli.repo.starts_with("https://"))
+            let local_backing = matches!(&store, Store::Local(_))
+                && cairn::objects::envelope(&store.get(&format!("snapshots/{id}"))?)?
+                    .0
+                    .local;
+            let stats = if local_backing {
+                ensure!(
+                    domain == keys.domain(),
+                    "copying a Btrfs backing requires its encryption key"
+                );
+                snapshot::copy_btrfs(
+                    &store,
+                    &destination,
+                    &keys,
+                    &id,
+                    &CaptureOptions {
+                        chunker,
+                        chunk_size,
+                        ignore_file: None,
+                    },
+                )?
+            } else if (cli.repo.starts_with("http://") || cli.repo.starts_with("https://"))
                 && matches!(
                     (&store, &destination),
                     (Store::Http { .. }, Store::Http { .. } | Store::Ssh(_))
-                ) {
+                )
+            {
                 destination.remote_import(&Import {
                     source: cli.repo,
                     snapshot: id.clone(),

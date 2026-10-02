@@ -1,4 +1,5 @@
 //! Cairn's experimental v1 snapshot store. The format is not yet stable.
+pub mod backing;
 pub mod capture;
 pub mod chunking;
 pub mod native_ssh;

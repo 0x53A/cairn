@@ -74,7 +74,11 @@ async fn fetch(
         if !store.exists(&key).map_err(error)? {
             return Ok(StatusCode::NOT_FOUND.into_response());
         }
-        Ok(store.get(&key).map_err(error)?.into_response())
+        let bytes = store.get(&key).map_err(error)?;
+        if bucket != "tags" {
+            crate::store::portable(&bytes).map_err(error)?;
+        }
+        Ok(bytes.into_response())
     })
     .await
     .map_err(|e| error(e.into()))?
@@ -84,11 +88,12 @@ async fn exists(
     Path((domain, bucket, id)): Path<(String, String, String)>,
 ) -> ApiResult {
     tokio::task::spawn_blocking(move || {
-        let present = app
-            .store(&domain)
-            .map_err(error)?
-            .exists(&format!("{bucket}/{id}"))
-            .map_err(error)?;
+        let store = app.store(&domain).map_err(error)?;
+        let key = format!("{bucket}/{id}");
+        let present = store.exists(&key).map_err(error)?;
+        if present && bucket != "tags" {
+            crate::store::portable(&store.get(&key).map_err(error)?).map_err(error)?;
+        }
         Ok(if present {
             StatusCode::OK
         } else {

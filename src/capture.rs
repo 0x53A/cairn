@@ -111,6 +111,37 @@ impl Source {
     pub fn finish(mut self) -> Result<()> {
         self.cleanup()
     }
+    /// Transfer ownership to a persistent backing. After the rename, failures
+    /// deliberately leave a retained orphan rather than risk deleting live data.
+    pub(crate) fn retain(mut self) -> Result<crate::backing::BtrfsBacking> {
+        let temporary = self
+            .temporary
+            .as_ref()
+            .context("retention requires a Btrfs snapshot")?;
+        let subtree = self.path.strip_prefix(temporary)?.to_owned();
+        let mut backing = crate::backing::BtrfsBacking::record(temporary, subtree)?;
+        let retained = temporary.with_file_name(format!(
+            ".cairn-retained-{}",
+            hex::encode(rand::random::<[u8; 16]>())
+        ));
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            temporary,
+            rustix::fs::CWD,
+            &retained,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )?;
+        self.temporary = None;
+        backing.path = retained;
+        eprintln!("retained Btrfs snapshot: {}", backing.path.display());
+        File::open(backing.path.parent().unwrap())?.sync_all()?;
+        rustix::fs::syncfs(File::open(backing.path.parent().unwrap())?)?;
+        if let Some(marker) = self.marker.take() {
+            fs::remove_file(&marker)?;
+            File::open(marker.parent().unwrap())?.sync_all()?;
+        }
+        Ok(backing)
+    }
     fn cleanup(&mut self) -> Result<()> {
         if let Some(path) = &self.temporary
             && path.try_exists()?

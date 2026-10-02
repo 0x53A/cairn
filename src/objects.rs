@@ -51,6 +51,12 @@ impl Keys {
         }
     }
     pub fn seal(&self, bytes: &[u8], refs: Vec<String>) -> Result<Vec<u8>> {
+        self.seal_with_backing(bytes, refs, false)
+    }
+    pub(crate) fn seal_local(&self, bytes: &[u8], refs: Vec<String>) -> Result<Vec<u8>> {
+        self.seal_with_backing(bytes, refs, true)
+    }
+    fn seal_with_backing(&self, bytes: &[u8], refs: Vec<String>, local: bool) -> Result<Vec<u8>> {
         let mut nonce = [0; 24];
         let key = self.derived("cairn v1 authenticated encryption");
         if key.is_some() {
@@ -59,6 +65,7 @@ impl Keys {
         let header = Header {
             refs,
             nonce: key.map(|_| hex::encode(nonce)),
+            local,
         };
         let hdr = serde_json::to_vec(&header)?;
         ensure!(hdr.len() <= MAX_HEADER, "object has too many references");
@@ -122,6 +129,9 @@ impl Keys {
 pub struct Header {
     pub refs: Vec<String>,
     nonce: Option<String>,
+    /// Local filesystem references must never enter the portable object protocol.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
 }
 
 pub fn valid_id(id: &str) -> bool {

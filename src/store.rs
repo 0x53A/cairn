@@ -154,6 +154,27 @@ impl Store {
     }
     /// Atomic create-if-absent; true means newly installed. Never overwrites.
     pub fn put(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        if !key.starts_with("tags/") {
+            portable(bytes)?;
+        }
+        let _lock = if let Some(id) = key.strip_prefix("snapshots/") {
+            crate::backing::lock(self, id, true)?
+        } else {
+            None
+        };
+        self.put_unlocked(key, bytes, false)
+    }
+
+    /// Internal local publication, with the caller holding the snapshot lock.
+    pub(crate) fn put_local(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        ensure!(
+            matches!(self, Self::Local(_)),
+            "Btrfs backing requires a local repository"
+        );
+        self.put_unlocked(key, bytes, true)
+    }
+
+    fn put_unlocked(&self, key: &str, bytes: &[u8], local: bool) -> Result<bool> {
         valid_key(key)?;
         ensure!(bytes.len() <= MAX_OBJECT, "object too large");
         validate_value(key, bytes)?;
@@ -164,7 +185,7 @@ impl Store {
                 == reqwest::StatusCode::CREATED),
             Self::Local(root) => {
                 if key.starts_with("snapshots/") {
-                    complete(self, envelope(bytes)?.0.refs)?;
+                    complete_with_backing(self, envelope(bytes)?.0.refs, local)?;
                 }
                 let path = root.join(key);
                 let dir = path.parent().unwrap();
@@ -184,7 +205,10 @@ impl Store {
                         let existing = self.get(key)?;
                         if key.starts_with("snapshots/") {
                             // The winner may use different chunk boundaries.
-                            complete(self, envelope(&existing)?.0.refs)?;
+                            if !local {
+                                portable(&existing)?;
+                            }
+                            complete_with_backing(self, envelope(&existing)?.0.refs, local)?;
                         }
                         File::open(&path)?.sync_all()?;
                         File::open(dir)?.sync_all()?;
@@ -202,6 +226,26 @@ impl Store {
                 Ok(r.status() == reqwest::StatusCode::CREATED)
             }
         }
+    }
+
+    /// Replace a local backing only after its portable replacement is complete.
+    /// Caller holds the exclusive backing lock for this ID.
+    pub(crate) fn replace_snapshot(&self, id: &str, bytes: &[u8]) -> Result<()> {
+        ensure!(valid_id(id), "invalid snapshot ID");
+        let Self::Local(root) = self else {
+            bail!("materialize requires a local repository")
+        };
+        portable(bytes)?;
+        complete(self, envelope(bytes)?.0.refs)?;
+        let dir = root.join("snapshots");
+        let mut temp = tempfile::NamedTempFile::new_in(&dir)?;
+        temp.write_all(bytes)?;
+        temp.as_file().sync_all()?;
+        temp.persist(dir.join(id))?;
+        File::open(dir)?
+            .sync_all()
+            .context("backing switched, but directory synchronization failed")?;
+        Ok(())
     }
     pub fn list(&self, bucket: &str) -> Result<Vec<String>> {
         ensure!(matches!(bucket, "snapshots" | "tags"), "invalid listing");
@@ -317,6 +361,10 @@ fn validate_value(key: &str, bytes: &[u8]) -> Result<()> {
 
 /// Check every reachable envelope before publishing a snapshot, without E2E keys.
 pub fn complete(store: &Store, refs: Vec<String>) -> Result<()> {
+    complete_with_backing(store, refs, false)
+}
+
+fn complete_with_backing(store: &Store, refs: Vec<String>, local: bool) -> Result<()> {
     let mut pending = refs;
     let mut seen = HashSet::new();
     while let Some(id) = pending.pop() {
@@ -325,12 +373,15 @@ pub fn complete(store: &Store, refs: Vec<String>) -> Result<()> {
         }
         ensure!(seen.len() <= 10_000_000, "object-count limit exceeded");
         let data = store.get(&format!("objects/{id}"))?;
+        if !local {
+            portable(&data)?;
+        }
         pending.extend(envelope(&data)?.0.refs);
     }
     Ok(())
 }
 
-fn durable_mkdir(path: &Path) -> Result<()> {
+pub(crate) fn durable_mkdir(path: &Path) -> Result<()> {
     if path.is_dir() {
         return Ok(());
     }
@@ -388,6 +439,7 @@ pub fn replicate(source: &Store, destination: &Store, id: &str) -> Result<Transf
     // Existing snapshot may use a different valid chunk recipe. Verify/copy that
     // recipe's graph separately; never overwrite an existing snapshot record.
     let snapshot = source.get(&snapkey)?;
+    portable(&snapshot)?;
     let (header, _, _) = envelope(&snapshot)?;
     let mut pending = header.refs;
     let mut seen = HashSet::new();
@@ -408,6 +460,7 @@ pub fn replicate(source: &Store, destination: &Store, id: &str) -> Result<Transf
             source.get(&key)?
         };
         let (header, _, _) = envelope(&data)?;
+        portable(&data)?;
         pending.extend(header.refs);
         if present {
             stats.objects_present += 1;
@@ -418,6 +471,14 @@ pub fn replicate(source: &Store, destination: &Store, id: &str) -> Result<Transf
     }
     destination.put(&snapkey, &snapshot)?;
     Ok(stats)
+}
+
+pub(crate) fn portable(bytes: &[u8]) -> Result<()> {
+    ensure!(
+        !envelope(bytes)?.0.local,
+        "local Btrfs backing requires key-holding local copy or materialize before remote/keyless access"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
